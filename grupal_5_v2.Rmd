@@ -1,0 +1,1088 @@
+---
+title: "Modulo5_grupal - Análisis de los datos de Bicimad mediante clustering"
+author: "Alejandra Mendez, Alvaro Cerrato, Francisco Martin, Juan Antonio Castro"
+date: "9/6/2019"
+output: 
+  html_document:
+    theme: spacelab
+    highlight: tango
+    fig_width: 7
+    fig_height: 6
+    fig_caption: true
+    code_folding: hide
+    number_sections: true
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: false
+---
+
+
+# SYSTEM SETUP
+## Paquetes de R
+En primer lugar se cargan los paquetes necesarios para el análisis, y se carga la tabla de datos original "Datos de uso Bicimad Agosto 2018".
+
+```{r load packages, warning=FALSE, message=FALSE}
+
+# Load de paquetes para analisis
+library(grDevices)
+library(geosphere)
+library(tidyverse)
+library(data.table)
+library(plotly)
+library(factoextra)
+library(ggpubr)
+library(Hmisc)
+library(corrplot)
+library(cluster)
+library(NbClust)
+library(reprex)
+library(magrittr)
+library(readr)
+library(Rtsne)
+
+# Load dataset target del estudio
+# Datos originales de Agosto 2018. 274 mil registros
+data_orig <- fread('Bicimad_201808_3.csv', na.strings = '\\N')
+
+```
+
+
+# DATA WRANGLING & FEATURE ENGINEERING
+## Tablas auxiliares
+Utilizamos datos externos para enriquezer el dataset. Se han utilizado las siguientes fuentes:
+
+* Tb. Estaciones - Dataset que contiene el id de estación, dirección, código postal, distrito, coordenadas geográficas... Estos datos se han enriquecido para las estaciones tanto de origen como destino.
+
+* Tb. Meteorológica - Datos metereológicos de Madrid por fecha con datos de temperatura y rachas de viento.
+
+* Tb. Edad - Tabla que relaciona el código de edad con la descripción literal.
+
+* Tb. Tipo de Usuario - Tabla que relaciona el código de tipo de ususario con su descripción literal.
+
+```{r tablas auxiliares}
+##### LECTURA DE TABLAS #####
+
+# Tb. estaciones -- inicio. Se carga el maestro de estaciones.
+master_estaciones_ini <- fread('tb_stations.csv', colClasses = 'character')
+master_estaciones_ini <- master_estaciones_ini %>% 
+  rename(name_station_ini = name,
+         longitude_station_ini = longitude,
+         latitude_station_ini = latitude,
+         address_station_ini = address,
+         idunplug_station_ini = id,
+         distrito_station_ini = distrito,
+         cp_ini = cod_postal) %>% 
+  dplyr::select(-number)
+
+
+# Tb. estaciones -- fin. 
+master_estaciones_fin <- fread('tb_stations.csv', colClasses = 'character')
+master_estaciones_fin <- master_estaciones_fin %>% 
+  rename(name_station_fin = name,
+         longitude_station_fin = longitude,
+         latitude_station_fin = latitude,
+         address_station_fin = address,
+         idplug_station_fin = id,
+         distrito_station_fin = distrito,
+         cp_fin = cod_postal) %>% 
+  dplyr::select(-c(number))
+
+# Tb. Meteo. Se carga y mapea el dataset con los datos climatológicos de agosto.  
+master_meteo <-  fread('tb_meteo.csv')
+master_meteo <- master_meteo %>%
+  rename(unplug_date = fecha) %>%
+  mutate(temp_max = as.numeric(sub(",", ".", temp_max, fixed = TRUE)),
+         temp_max_hora = as.numeric(sub(",", ".", temp_max_hora, fixed = TRUE)),
+         temp_min = as.numeric(sub(",", ".", temp_min, fixed = TRUE)),
+         temp_min_hora = as.numeric(sub(",", ".", temp_min_hora, fixed = TRUE)),
+         temp_media = as.numeric(sub(",", ".", temp_media, fixed = TRUE)))
+
+# Tb. Edad. Maestro de edad
+master_edad <- fread('tb_ageRange.csv', colClasses = 'character')
+
+# Tb. userType. Maestro de tipo de usuarios
+master_user <- fread('tb_userType.csv', colClasses = 'character')
+
+
+```
+
+En el dataset enriquecido se ha filtrado por código de estación para trabajar únicamente con las estaciones en el distrito "Distrito Retiro", añadiendo estaciones que por proximidad pueden resultar interesante spara el estudio.
+
+El dataset enriquezido, de ahora en adelante referido como **dataset target** (var(data)), se ha cruzado por campos comunes y se han normalizados los *data types*. Además, se ha calculado la distancia mínima entre estaciones computando la *Haversine distance* entre coordenadas.
+
+```{r wrangling}
+# DATA WRANGLING 
+
+# Filtrar por estaciones que nos interesan
+estaciones_retiro <- c(64,65,66,69,72,73,74,75,78,79,80,84,85,86,88,90,91,99,100,101,102,107)
+
+# Se unen dataset con los maestros de estaciones, datos meteorológicos, edad y tipo de usuario
+data <- data_orig %>% 
+  rename(movimiento_id = "id_mov") %>% 
+  filter(idunplug_station_ini %in% estaciones_retiro | idplug_station_fin %in% estaciones_retiro) %>% 
+  mutate(idunplug_station_ini = as.character(idunplug_station_ini),
+         cp_ini = as.character(cp_ini),
+         idunplug_base = as.character(idunplug_base),
+         idplug_station_fin = as.character(idplug_station_fin),
+         cp_fin = as.character(cp_fin),
+         idplug_base = as.character(idplug_base),
+         user_type = as.character(user_type),
+         user_age_range = as.character(user_age_range),
+         user_zip_code = as.character(user_zip_code),
+         bank_holiday_flg = as.character(bank_holiday_flg),
+         unplug_hour = as.character(unplug_hour),
+         unplug_date=as.character(unplug_date)
+         ) %>% 
+  dplyr::select(-c(unplug_hourtime)) %>% 
+  left_join(master_edad, by='user_age_range') %>% 
+  left_join(master_user, by='user_type') %>% 
+  left_join(master_estaciones_ini, by=c('idunplug_station_ini', 'cp_ini')) %>% 
+  left_join(master_estaciones_fin, by=c('idplug_station_fin', 'cp_fin')) %>% 
+  mutate(longitude_station_ini = as.numeric(longitude_station_ini),
+         latitude_station_ini = as.numeric(latitude_station_ini),
+         longitude_station_fin = as.numeric(longitude_station_fin),
+         latitude_station_fin = as.numeric(latitude_station_fin)) %>% 
+  mutate(distance = distHaversine(cbind(longitude_station_ini, latitude_station_ini), cbind(longitude_station_fin, latitude_station_fin))) %>%
+           left_join(master_meteo, by='unplug_date')
+
+
+rm(data_orig, master_edad, master_estaciones_fin, master_estaciones_ini, master_meteo, master_user, estaciones_retiro)
+
+# Ordenar variable 'day'
+data$day <- factor(data$day, levels=c('L','M','X','J','V','S','D'))
+
+# save(data, file='data.RData')
+
+```
+
+
+# ANALISIS EXPLORATORIO
+El posterior análisis exploratorio describe el dataset target por variables individuales y cruzes entre variables mediante análisis gráficos y sus estadíticos principales.  
+
+### Distrito de inicio
+Más allá de que el distrito 02 - retiro sea el mayoritario (pues estamos influyendo en ello), se observa que los distritos más recurrentes como inicio de viaje son los colindantes al propio retiro, aunque destaca que distrito se situe por encima de Salamanca, cuando es este último el distrito más cercano al propio parque, por lo que ya denota una tendencia natural de los usuarios.
+
+```{r distrito_station_ini estadisticos}
+
+x <- data %>% group_by(distrito_station_ini) %>% summarise(n = length(user_id))
+rm(x)
+
+x <- data %>% 
+  group_by(distrito_station_ini) %>% 
+  summarise(n = length(distrito_station_ini)) %>% 
+  ungroup() %>% 
+  mutate(porc = n/sum(n)) %>% 
+  filter(porc*100 >= 0.1)
+
+z <- ggplot(x, aes(x=distrito_station_ini, y=porc*100))+theme_classic()+
+  geom_bar(stat = "identity",fill="lightblue")+ labs(title="Distrito de partida", x="", y="%")+theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggplotly(z)
+
+rm(x, z)
+
+```
+
+### Codigo postal de inicio
+Los códigos postales de las estaciones de inicio directamente vinculados con la situación de las estaciones siguen la misma distribución.
+
+```{r cp_ini}
+x <- data %>% 
+  group_by(cp_ini) %>% 
+  summarise(n = length(cp_ini)) %>% 
+  ungroup() %>% 
+  mutate(porc = n/sum(n))
+
+# p <- ggplot(x, aes(x=cp_ini, y=porc*100)) +
+#   geom_bar(stat = "identity") +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p <- ggplot(x, aes(x=cp_ini, y=porc*100))+theme_classic()+
+  geom_bar(stat = "identity",fill="lightblue")+ labs(title="Código postal de inicio", x="", y="%")+ theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggplotly(p)
+
+rm(x, p)
+```
+
+### Estacion de inicio
+
+```{r idunplug_station_ini}
+# 1.2 ID UNPLUG_STATION INI
+x <- data %>% group_by(idunplug_station_ini) %>% summarise(n = length(user_id))
+
+x <- data %>% 
+  group_by(idunplug_station_ini) %>% 
+  summarise(n = length(idunplug_station_ini)) %>% 
+  ungroup() %>% 
+  mutate(porc = n/sum(n)) %>% 
+  filter(porc*100 >= 0.1)
+
+p <- ggplot(x, aes(x=idunplug_station_ini, y=porc*100))+theme_classic()+
+   geom_bar(stat = "identity",fill="lightblue")+ labs(title="Estación de partida", x="", y="%") + theme(axis.text.x = element_text(angle = 90))
+ggplotly(p)
+
+rm(x,p)
+```
+
+
+### Distrito de fin
+Para los distritos en los que finalizan los trayectos, vuelve a aparecer una tendencia en dirección a la zona centro superando a Salamanca que es la distrito más cercano al parque del retiro.
+
+```{r distrito_station_fin estadistico}
+x <- data %>% group_by(distrito_station_fin) %>% summarise(n = length(user_id))
+rm(x)
+
+x <- data %>% 
+  group_by(distrito_station_fin) %>% 
+  summarise(n = length(distrito_station_fin)) %>% 
+  ungroup() %>% 
+  mutate(porc = n/sum(n)) %>% 
+  filter(porc*100 >= 0.1)
+
+z <- ggplot(x, aes(x=distrito_station_fin, y=porc*100))+theme_classic()+
+  geom_bar(stat = "identity",fill="lightblue")+ labs(title="Distrito de llegada", x="", y="%")+ theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggplotly(z)
+
+rm(x, z)
+
+```
+
+### Codigo postal de fin
+Distribución calcada con las estaciones de inicio, pues estamos eligiendo aquellos viajes que comienzan o terminan en el retiro.
+
+```{r cp_fin}
+x <- data %>% 
+  group_by(cp_fin) %>% 
+  summarise(n = length(cp_fin)) %>% 
+  ungroup() %>% 
+  mutate(porc = n/sum(n))
+
+# p <- ggplot(x, aes(x=cp_fin, y=porc*100)) + 
+#   geom_bar(stat = "identity") + 
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p <- ggplot(x, aes(x=cp_fin, y=porc*100))+theme_classic()+
+    geom_bar(stat = "identity",fill="lightblue")+ labs(title="Codigo postal de fin", x="", y="%")
+  ggplotly(p)
+
+rm(x, p)
+```
+
+
+### Estacion de fin
+Conclusiones similares a las estaciones de inicio, donde al estar filtrando por los viajes que se inician o terminan en el retiro estamos forzando que estas estaciones sean más frecuentes.
+
+```{r idplug_station_fin}
+x <- data %>% 
+  group_by(idplug_station_fin) %>% 
+  summarise(n = length(idplug_station_fin)) %>% 
+  ungroup() %>% 
+  mutate(porc = n/sum(n)) %>% 
+  filter(porc*100 >= 0.1)
+
+# p <- ggplot(x, aes(x=idplug_station_fin, y=porc*100)) +
+#   geom_bar(stat = "identity") +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p <- ggplot(x, aes(x=idplug_station_fin, y=porc*100))+theme_classic()+
+  geom_bar(stat = "identity",fill="lightblue")+ labs(title="Estación de llegada", x="", y="%")
+
+ggplotly(p)
+
+rm(x, p)
+```
+
+### Tipo de usuario
+Los usuarios conabono anual son muy claramente mayoritarios, estando presentes en el 86% de los viajes que se inician o terminan en el retiro, con menos de un 10% los trabajadores de Bicimad y con el 4% los usuarios con abono ocasional.
+
+```{r user_type}
+x <- data %>% 
+  group_by(user_type_lit) %>% 
+  summarise(n = length(user_type_lit)) %>% 
+  ungroup() %>% 
+  mutate(porc = n/sum(n))
+  
+
+# p <- ggplot(x, aes(x=user_type, y=porc*100)) + 
+#   geom_bar(stat = "identity") + 
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p <- ggplot(x, aes(x=user_type_lit, y=porc*100))+theme_classic()+
+    geom_bar(stat = "identity",fill="lightblue")+ labs(title="Tipo de usuario", x="", y="%")
+
+ggplotly(p)
+
+rm(x, p)
+```
+
+### Rango de edad de usuario
+Anque la mayoría de usuarios no declaran la edad, de aquellos que la declaran el rango. Si excluimos a estos y recalculamos los procentajes estaríamos diciendo que la mitad de los viajes con origen o destino en el retiro son por usuarios de entre 27 y 40 años, donde si unimo los usuarios de 27  a 40, tendríamos un peso del 86% de usuarios adultos. Con esto coge peso la teoría de que es un servicio usado por gente adulta, pudiendo ser usada para desplazamientos en dirección al trabajo, por ejemplo.
+
+```{r user_age_range}
+x <- data %>% 
+  group_by(user_age_range_lit) %>% 
+  summarise(n = length(user_age_range_lit)) %>% 
+  ungroup() %>% 
+  mutate(porc = n/sum(n)) 
+  
+p <- ggplot(x, aes(x=user_age_range_lit, y=porc*100))  + 
+    theme_classic() +
+    geom_bar(stat = "identity",fill="lightblue") + 
+    labs(title="Rango de edad de usuario", x="Grupo", y="%")+
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggplotly(p)
+
+rm(x, p)
+```
+
+### Codigo postal de usuario
+Aunque gran parte de los usuarios no declaran su codigo portal, en el histograma destaca la perdida de peso del código postal 28014, que si estaba muy presente en las estaciones de inicio y fin. Esto podría ser acausa de que esta localización es más turistica que residencial.
+
+```{r codpostal de usuario}
+x <-  filter(data,!is.na(user_zip_code))
+x <- x %>% 
+  group_by(user_zip_code) %>% 
+  summarise(n = length(user_zip_code)) %>% 
+  ungroup() %>% 
+  mutate(porc = n/sum(n))%>% 
+  filter(porc*100 >= 0.1)
+
+p <- ggplot(x, aes(x=user_zip_code, y=porc*100))  +
+    theme_classic() +
+    geom_bar(stat = "identity",fill="lightblue") +
+    labs(title="Codigo postal de usuario", x="", y="%")+
+   theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+ggplotly(p)
+
+rm(x, p)
+```
+
+### Dia de la semana del trayecto
+En base al histograma, el servicio de bicimad para los viajes relativos a retiro, parece ser usado como media de transporte rutinaria, más que a modo ocasional, con una tendencia muy marcada durante la semana, que cae en el fin de semana. Es posible que si cogiesemos un dataset de otro mes que no sea de un periodo vacacional, estas diferencias sean más marcadas todabía.
+
+```{r day}
+x <- data %>% 
+  group_by(day) %>% 
+  summarise(n = length(day)) %>% 
+  ungroup() %>% 
+  mutate(porc = n/sum(n))
+
+
+p <- ggplot(x, aes(x=day, y=porc*100))  +
+    theme_classic() +
+    geom_bar(stat = "identity",fill="lightblue") +
+    labs(title="Día de la semana", x="", y="%")
+
+ggplotly(p)
+
+rm(x, p)
+
+```
+
+### Festivos/Laborables
+Se observa que el 77% de los trayectos ocurren en dias laborables, y el restate en festivos(incluyendo el dia 15 de Agosto).
+
+```{r bank_holiday_flg}
+x <- data %>% 
+  group_by(bank_holiday_flg) %>% 
+  summarise(n = length(bank_holiday_flg)) %>% 
+  ungroup() %>% 
+  mutate(porc = n/sum(n))
+
+p <- ggplot(x, aes(x=bank_holiday_flg, y=porc*100)) + 
+     theme_classic() +
+     geom_bar(stat = "identity",fill="lightblue") +
+     labs(title=" Laborables vs Festivos", x="", y="%")
+ggplotly(p)
+
+rm(x, p)
+```
+
+### Hora de inicio del trayecto
+Se notan horas pico coincidiendo con el inicio (8) y fin (19) de la que podría ser una jornada laboral, acentuando además las 15h entendiendolo como la hora de comer. En un análisis más profundo, filtrando por bank_holiday_flg = 0, es decir, dias laborables, esta diferencia se ve acentuada.
+
+```{r unplug_hour}
+
+x <- data %>% 
+  group_by(unplug_hour,bank_holiday_flg) %>% 
+  summarise(n = length(unplug_hour)) %>% 
+  ungroup() %>% 
+  mutate(porc = n/sum(n))
+x$unplug_hour=as.numeric(x$unplug_hour)
+p <- ggplot(x, aes(x=unplug_hour, y=porc*100)) + 
+    theme_classic() +
+    geom_bar(stat = "identity",fill="lightblue") +
+    labs(title="Hora de inicio del trayecto", x="", y="%") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggplotly(p)
+rm(x, p)
+
+```
+
+## ESTADISTICOS PRINCIPALES
+
+### Duracion del trayecto
+Transformando la variale numérica de travel_time a minutos para hacerla más legible, observamos que aunque existen outliers, con viajes de 8.000 min o de 0.17 min, la media de los viajes está entorno a 11 minutos, situándose el 3er cuartil por debajo de los 20 minutos.
+
+```{r stats travel_time}
+data <- data %>% 
+  mutate(travel_time_mins = travel_time/60)
+```
+
+Descripcion de estadisticos:
+```{r}
+summary(data$travel_time_mins)
+```
+
+Desviacion estandar:
+```{r}
+sd(data$travel_time_mins)
+```
+
+Varianza:
+```{r}
+var(data$travel_time_mins)
+```
+
+
+### Distancia del trayecto
+Observamos que la distancia media recorrida está entorno a los 2KM. La mayoría de los viajes están contenidos en la franja de los 1-3km.
+
+Descripcion de estadisticos:
+```{r stats distance}
+summary(data$distance)
+```
+
+Desviacion tipica:
+```{r}
+sd(data$distance)
+```
+
+Varianza:
+```{r}
+var(data$distance)
+```
+
+
+### Temperatura maxima
+Altas temperaturas sin bajas de los 30 grados, sin haber grandes dispersiones. De haber sido otros meses para analizar, habría cogido valor, el introducir datos referentes a las precipitaciones
+
+Descripcion de estadisticos:
+```{r stats temp_max}
+summary(data$temp_max)
+```
+
+Desviacion tipica:
+```{r}
+sd(data$temp_max)
+```
+
+Varianza:
+```{r}
+var(data$temp_max)
+```
+
+
+### Temperatura minima
+De igual manera las temperaturas minimas con poca dispersión e igualmente altas.
+
+Descripcion de estadisticos:
+```{r stats temp_min}
+summary(data$temp_min)
+```
+
+Desviacion tipica:
+```{r}
+sd(data$temp_min)
+```
+
+Varianza:
+```{r}
+var(data$temp_min)
+```
+
+
+### Velocidad del viento maximas
+Descripcion de estadisticos:
+```{r stats viento_max}
+summary(data$viento_max)
+```
+
+Desviacion tipica:
+```{r}
+sd(data$viento_max)
+```
+
+Varianza:
+```{r}
+var(data$viento_max)
+```
+
+
+
+# ANALISIS DE OUTLIERS
+
+## TRAVEL_TIME
+En primera instancia, cuando tratamos de analizar la variable travel time, los outliers no nos dejan ver realmente como se comportan los usuarios, en el momento que los dejamos de lado para pintar el boxplot, observamos lo que nos desprendió el análisis estadistico, donde el servicio era usado para viajes relativamente cortos en su mayoría.
+
+```{r outliers travel_time}
+
+# 1.C.1 TRAVEL_TIME
+# Anadir 'travel_time' en minutos
+data <- data %>% 
+  mutate(travel_time_mins = travel_time/60)
+
+# Identificacion de outliers
+outliers_travel_time_mins <- boxplot.stats(data$travel_time_mins)$out
+p <- ggplot(data, aes(y=travel_time_mins)) + geom_boxplot() + labs(title="Travel_time - outliers")
+ggplotly(p)
+
+# Quitando outliers de 'data'
+data_no_outliers <- data[-which(data$travel_time_mins %in% outliers_travel_time_mins),]
+# save(data_no_outliers, file='data_no_outliers.RData')
+
+# Boxplot - 'data_no_outliers'
+p <- ggplot(data_no_outliers, aes(y=travel_time_mins)) + geom_boxplot() + labs(title="Travel_time - no outliers")
+ggplotly(p)
+
+rm(p, outliers_travel_time_mins)
+
+```
+
+## DISTANCE
+Los outliers no dificultan tanto el análisis de la variable en este caso, aun así en el momento que los excluimos observamos que en terminos generales los viajes rondan los 1 a 3 KM.
+
+```{r outliers distance}
+# 1.C.2 DISTANCE
+# Identificacion de outliers
+outliers_distance <- boxplot.stats(data$distance)$out
+p <- ggplot(data, aes(y=distance)) + geom_boxplot() + labs(title="Distance - outliers")
+ggplotly(p)
+
+# Quitando outliers de 'data'
+data_no_outliers_mod <- data[-which(data$distance %in% outliers_distance),]
+
+# Boxplot - 'data_no_outliers'
+p <- ggplot(data_no_outliers_mod, aes(y=distance)) + geom_boxplot() + labs(title="Distance - no outliers")
+ggplotly(p)
+
+rm(p, outliers_distance, data_no_outliers_mod)
+```
+
+# ANALISIS BIVARIANTE
+Para conocer la relación entre dos variables categóricas utilizaremos:
+
+Tablas de contingencia para describir esta relación a nivel muestral.
+Test de chi-cuadrado para hacer inferencia sobre la relación entre ambas variables.
+
+## Tb.Contingencia - Edad de usuario v. Tipo de usuario 
+
+- El test de Chi cuadrado no muestra que haya una correlación clara. 
+- Hay 2 rangos principales (27-65 años) que aglutinan la mayor parte de valores. Esto nos llevará a hacer un análisis más profundo para determinar si el uso principal de bicimad son trabajadores.
+- Hay muchos usuarios con edad desconocida lo que desvirtúa el dataset. 
+- Los usuarios ocasionales no suelen registrar su edad, por lo que podemos inferir que su representatividad porcentual dentro del grupo "unknown" es más elevada que para trabajadores o usuarios anuales.
+
+```{r corr user_type&user_age_range, warning=FALSE}
+
+#0 - Unknown
+#1 - 0 y 16 años
+#2 - 17 y 18 años
+#3 - 19 y 26 años
+#4 - 27 y 40 años
+#5 - 41 y 65 años
+#6 - > 66 años
+
+frec <- round(prop.table(table(data$user_type, data$user_age_range))*100, 2)
+frec
+#Calculamos "Chi-cuadrado"
+chisq.test(table(data$user_type, data$user_age_range))
+
+#Visualizamos la relación en un histograma
+#heatmap(table(data$user_type, data$user_age_range), Colv = NA, Rowv = NA, xlab="user_age_range", ylab="user_type")
+
+barplot(frec, beside=FALSE,legend.text= rownames(frec[1]), main='Distribución % Tipo usuario por edad', xlab='Rangos Edad', ylab='% Distribución tipo usuario')
+
+rm(frec)
+
+```
+
+## Estudio por Edad de los trayectos con distrito final enel Retiro y distrito inicial diferente 
+
+- Por el valor de P-value se concluye que no haya correlación entre variables.
+- Destacan el distrito Centro y Salamanca como distritos con más viajes de inicio
+- Tetuan y Moncloa los que menos viajes presentan.
+- Respecto a los rangos de Edad tiene lógica que los Jubilados que viven en Salamanca sean los que más vayan al retiro.
+
+```{r corr distrito_ini&user_age_range, warning=FALSE}
+
+#Generamos la tabla de variables eliminando como distrito inicial el Retiro 
+table_distrit_age <- data %>% 
+  dplyr::select(c(distrito_station_ini,user_age_range)) %>% 
+  filter(grepl("03",distrito_station_ini)==FALSE) %>% 
+  mutate(distrito_station_ini = as.factor(distrito_station_ini),
+         user_age_range = as.factor(user_age_range))
+
+#Realizamos la matriz de contingencia de las frecuencias relativas
+round(prop.table(table(table_distrit_age))*100, 2)
+
+#Incluimos simulación Chi-cuadrado 
+chisq.test(table_distrit_age$distrito_station_ini,table_distrit_age$user_age_range)
+
+#Obtenemos un Warning al tener valores inferiores a 5 y realizamos también el Test de fisher
+fisher.test(table_distrit_age$distrito_station_ini,table_distrit_age$user_age_range,simulate.p.value=TRUE)
+
+#Visualizamos la relación en un mapa de calor
+heatmap( xtabs(~  user_age_range + distrito_station_ini, table_distrit_age), ylab="user_age_range",margins =c(10,7))
+
+rm(table_distrit_age)
+
+```
+
+
+
+## Estudio por Edad de los trayectos con origen distrito Retiro y distrito final diferente al Retiro.
+
+- El test de Fisher devuelve un concluye que no hay correlación entre variables.
+- Destacan el distrito Centro y Retiro como distritos con mayor número de trayectos como destino final.
+- Moncloa y Chamartin son los que menos movimientos presentan cómo destino final para trayectos iniciados en el Retiro.
+
+```{r corr distrito_final&user_age_range, warning=FALSE}
+
+#Extraemos la variable distrito inicial con movimientos que parte solo del Retiro 
+table_distrit_fin_age<- data %>% 
+  dplyr::select(c(distrito_station_fin,user_age_range,distrito_station_ini)) %>% 
+  filter(grepl("03",distrito_station_ini)==TRUE)%>%
+  mutate(distrito_station_fin=as.factor(distrito_station_fin),
+         user_age_range=as.factor(user_age_range))%>%
+  dplyr::select(-c(distrito_station_ini))
+
+#Matriz de contingencia destacando frecuencia de edad (Sumatoria cols = 1)
+round(prop.table(table(table_distrit_fin_age))*100, 2)
+
+#Realizamos también el Test de fisher
+fisher.test(table(table_distrit_fin_age),simulate.p.value=TRUE)
+
+#Visualizamos la relación 
+heatmap( xtabs(~  user_age_range + distrito_station_fin, table_distrit_fin_age), ylab="user_age_range",margins =c(10,7))
+
+rm(table_distrit_fin_age)
+
+```
+
+
+# ANALISIS DE CORRELACION
+
+El objetivo es detectar posibles relaciones lineales entre las variables. Si presentan un fuerte grado de correlación, buscar la forma funcional que mejor explique la variable dependiente a partir de la independiente (Análisis de regresión)
+
+```{r load data_cont}
+
+# Dataset con solo variables continuas
+data_cont <- select_if(data, is.numeric)
+summary(data_cont)
+
+```
+
+Generamos la matriz de coeficientes de correlación de Pearson y Spearman para todos los pares de variables:
+
+- Correlación de Pearson (r):  tendencias lineales
+- Correlación de Spearman (s): tendencias monótonas (ritmo no constante)
+
+## Matriz de correlación - Pearson
+
+- La geolocalización de las estaciones guarda ligera relación con la distancia. 
+- Las variables meteorológicas tienen una leve correlación.
+
+```{r corr Pearson, warning=FALSE}
+
+# Matriz de correlacion de Pearson
+corr_matrix_p <- rcorr(as.matrix(data_cont))
+
+# Mostramos los valores de los coeficientes y no se identifica ningún valor cercano a 1 o -1
+corr_matrix_p[["r"]]
+
+# Heatmap Pearson
+corrplot(corr_matrix_p$r, type = "upper", order = "alphabet", tl.col = "black", win.asp = 0.8, tl.cex = 0.8 , title="Heatmap - Pearson", mar=c(0,0,1,0))
+
+rm(corr_matrix_p)
+
+```
+
+
+## Matriz de correlación - Spearman
+
+- Se puede apreciar una ligera correlación directa entre tiempo y distancia 
+
+```{r corr Spearman}
+
+# Matriz de correlación de Spearman
+corr_matrix_s <- rcorr(as.matrix(data_cont), type="spearman")
+
+# Mostramos los valores de los coeficientes y no se identifica ningún valor cercano a 1 o -1
+corr_matrix_s[["r"]]
+
+# Heatmap Spearman
+corrplot(corr_matrix_s$r, type = "upper", order = "alphabet", tl.col = "black", win.asp = 0.8, tl.cex = 0.8, title="Heatmap - Spearman", mar=c(0,0,1,0))
+
+rm(corr_matrix_s)
+
+```
+
+
+## Análisis gráfico - distance vs travel_time_mins
+```{r  travel_time_mins v. distance plot}
+
+ggplot( data_cont , aes(x = distance, y = travel_time_mins)) +
+  geom_point() + 
+  theme(plot.subtitle = element_text(vjust = 1), 
+        plot.caption = element_text(vjust = 1),
+        panel.grid.major = element_line(colour = "orange"), 
+        axis.title = element_text(face = "bold"), 
+        axis.text = element_text(face = "bold"), 
+        plot.title = element_text(face = "bold", colour = "chocolate")) +
+  labs(title = "Estudio Correlación Distancia - Tiempo Viaje", subtitle = "")
+
+
+```
+
+Eliminamos Outliers que como vimos antes son duraciones superiores a 1,30 horas segundos y descartando a los trabajadores
+
+```{r travel_time_mins v. distance filtered}
+y <- data %>% 
+  select(distance, travel_time_mins,user_type) %>% 
+  filter(travel_time_mins < 87,
+         distance > 0,
+         user_type=='1'|user_type=='2') %>%
+  dplyr::select(-c(user_type))
+
+ggplot( y , aes(x = distance, y = travel_time_mins)) + 
+  geom_point() + 
+  geom_smooth(method=lm) + 
+  theme(plot.subtitle = element_text(vjust = 1), 
+        plot.caption = element_text(vjust = 1), 
+        panel.grid.major = element_line(colour = "orange"), 
+        axis.title = element_text(face = "bold"), 
+        axis.text = element_text(face = "bold"), 
+        plot.title = element_text(face = "bold", colour = "chocolate")) + 
+  labs(title = "Estudio Correlación Distancia - Tiempo Viaje", subtitle = "")
+
+rm(y)
+
+```
+
+- Se puede apreciar una ligerísima correlación directa entre tiempo y distancia 
+- La hora de viento máximo tiene una muy leve correlación inversa con la temperatura mínima 
+- La geolocalización de las estaciones guarda ligera relación con la distancia. 
+
+## Análisis de correlación - user_type vs travel_time_mins
+
+```{r distrito v. travel_time_mins v.user_type}
+
+#Extraemos la variable distrito inicial eliminado Retiro 
+table_travel_user <- data %>% 
+  dplyr::select(c(travel_time_mins, user_type)) %>% 
+  mutate(user_type = as.numeric(user_type))
+
+#calculamos coeficiente de pearson
+cor.test(table_travel_user$travel_time_mins, table_travel_user$user_type, method = c("pearson"))
+
+#filtramos para los valores 1 y 2, eliminando trayectos de la empresa
+z <- table_travel_user %>%
+  filter(user_type=='1'|user_type=='2')
+
+cor.test(z$travel_time_mins, z$user_type, method = c("pearson"))
+
+rm(table_travel_user, z)
+
+```
+No hay correlación entre el tipo de usuario y el tiempo. Se puede ver que eliminado los trayectos de los trabajadores, subre ligeramente el coeficiente de pearson, ya que los trayecto son más duraderos.
+
+## Análisis de correlación - user_age vs travel_time_mins
+
+```{r distrito v. travel_time_mins v. user_age_range}
+#Extraemos la variable distrito inicial eliminado Retiro 
+table_travel_age <- data %>% 
+  dplyr::select(c(travel_time_mins, user_age_range)) %>% 
+  mutate(user_age_range = as.numeric(user_age_range))
+
+#calculamos coeficiente de pearson
+cor.test(table_travel_age$user_age_range, table_travel_age$travel_time_mins, method = c("pearson"))
+```
+
+Al filtrar los usuarios de edad desconocidos el p_value pasa de negativo a ser >0,5, aunque el test no refleja correlación directa, si que parece que a mayor edad menor tiempo 
+
+```{r cor distrito v. travel_time_mins v. user_age_range}
+#filtramos los desconocidos
+table_trave_age_filter <- table_travel_age%>%
+  filter(user_age_range!=0)
+
+cor.test(table_trave_age_filter$user_age_range, table_trave_age_filter$travel_time_mins, method = c("pearson"))
+
+rm(table_travel_age, table_trave_age_filter)
+
+```
+
+## Análisis de correlación - hour.temp max vs unplug_hour
+
+Estudio por hora de la posible correlación entre la hora de temperatura máxima e inicio del trayecto.
+
+- El test de pearson no de fiabilidad de correlación. 
+- El dataset de Meteo con más meses si que podría haber sido de más utilidad.
+- También recogíamos la variable lluvia, pero en Agosto de 2018 la pluviometría fue de 0,6 L.
+
+```{r corr unplug_hour&temp_max_hour }
+
+#Generamos la tabla con dos variables
+table_hour_max <- data %>% 
+  dplyr::select(c(unplug_hour, temp_max_hora)) %>% 
+  mutate (unplug_hour= as.numeric(unplug_hour),
+          temp_max_hora = as.numeric(temp_max_hora))
+
+
+#Realizamos también el Test de Pearson
+cor.test(table_hour_max$unplug_hour, table_hour_max$temp_max_hora, method = c("pearson"))
+
+rm(table_hour_max)
+
+```
+
+# MODELOS DE CLUSTERING
+
+## PAM
+Se utiliza PAM (Partición Alrededor de Medoids) que es un algoritmo de clasificación del tipo  k-medoids. Escoge datapoints como centros y trabaja con una métrica arbitraria de distancias entre datapoints.
+
+```{r modelamos y filtramos el dataset para PAM}
+vars_cluster <- data %>% 
+  filter(between (unplug_date,'01/08/2018','28/08/2018')) %>%
+  filter( user_type == '1') %>%
+  select(idunplug_station_ini,cp_ini,idplug_station_fin,cp_fin,travel_time,user_type,
+         user_age_range,unplug_hour,distance,day, bank_holiday_flg) %>%
+  mutate(
+    day = case_when(
+      day =='L' ~ 0,
+      day =='M' ~ 1,
+      day =='X' ~ 2,
+      day =='J' ~ 3,
+      day =='V' ~ 4,
+      day =='S' ~ 5,
+      day =='D' ~ 6),
+    user_age_range=as.factor(user_age_range),
+    unplug_hour=as.factor(unplug_hour),
+    user_type=as.factor(user_type),
+    idunplug_station_ini=as.factor(idunplug_station_ini),
+    idplug_station_fin=as.factor(idplug_station_fin),
+    cp_ini=as.factor(cp_ini),
+    cp_fin=as.factor(cp_fin),
+    bank_holiday_flg=as.factor(bank_holiday_flg))
+   #filtramos para quedarnos con los tipos 1 y 2
+   
+#Selecionamos variables
+data_cluster <- vars_cluster %>%
+  select(idunplug_station_ini,cp_ini,idplug_station_fin,cp_fin,travel_time,user_type,
+         user_age_range,unplug_hour,distance,day,bank_holiday_flg)
+
+rm (vars_cluster)
+```
+
+### CON OUTLIERS
+En esta ejecucion del algoritmo se utilizan los datos con outliers (sin filtrado previo). Hacemos un subconjunto de 2500 muestras y calculamos el número de clusters recomendados para el Kmeans con el método del codo.
+```{r modelamos y filtramos el dataset}
+#Subsetting para clasterizar.
+data_cluster_sample <- sample_n(data_cluster, 2500)
+
+#Num cluster - Elbow method for KMEANS
+fviz_nbclust(x = data_cluster_sample, FUNcluster = kmeans, method = "wss", k.max = 20) +
+  geom_vline(xintercept = 5, linetype = 2)
+```
+
+Calculamos la distancia de Gower más representativa para el algoritmo PAM y utilizamos el método Silhouette, donde se escoge el primer pico cómo número posible de clusters.
+```{r calculo distancia de gower}
+
+data_cluster <- data_cluster %>%
+  select(idunplug_station_ini,cp_ini,idplug_station_fin,cp_fin,travel_time,user_type,
+         user_age_range,unplug_hour,distance,day)
+
+rm (vars_cluster)
+# PAM - Gower Distance
+gower_dist <- daisy(data_cluster_sample, metric = "gower")
+#2 clusters has the highest silhouette width. Let’s pick k = 5
+
+#search for a number of clusters
+sil_width <- c(NA)
+for(i in 2:8){  
+  pam_fit <- pam(gower_dist, diss = TRUE, k = i)  
+  sil_width[i] <- pam_fit$silinfo$avg.width  
+}
+plot(1:8, sil_width,
+     xlab = "Number of clusters",
+     ylab = "Silhouette Width")
+lines(1:8, sil_width)
+```
+
+
+Ejecutamos el algoritmo PAM para 4 clusteres
+
+```{r calculo algoritmo PAm 4}
+#executing the algorithm with 4 clusters
+k <- 4
+pam_fit <- pam(gower_dist, diss = TRUE, k)
+pam_results <- data_cluster_sample %>%
+  mutate(cluster = pam_fit$clustering) %>%
+  group_by(cluster) %>%
+  do(the_summary = summary(.))
+
+#Visualization in a lower dimensional space
+tsne_obj <- Rtsne(gower_dist, is_distance = TRUE)
+tsne_data <- tsne_obj$Y %>%
+  data.frame() %>%
+  setNames(c("X", "Y")) %>%
+  mutate(cluster = factor(pam_fit$clustering))
+ggplot(aes(x = X, y = Y), data = tsne_data) +
+  geom_point(aes(color = cluster))
+```
+
+
+Se observa que  la clasterización no es muy buena con 4 clusters. Probamos con 5 que es lo que nos recomiendan ambos métodos de distancia. 
+
+Se obtiene una mejor representación, aunque debido a la muestra de 2500 muestras a veces la clasificación no es muy adecuada..
+```{r modelamos y filtramos el dataset para PAM 5 clusters}
+#The results looks like 3-4cluster, so we enter again.
+
+k <- 5
+pam_fit <- pam(gower_dist, diss = TRUE, k)
+pam_results <- data_cluster_sample %>%
+  mutate(cluster = pam_fit$clustering) %>%
+  group_by(cluster) %>%
+  do(the_summary = summary(.))
+```
+
+Visualización del modelo con 5 clusters.
+```{r visualizado por 5 clusters}
+#Visualization in a lower dimensional space
+tsne_obj <- Rtsne(gower_dist, is_distance = TRUE)
+tsne_data <- tsne_obj$Y %>%
+  data.frame() %>%
+  setNames(c("X", "Y")) %>%
+  mutate(cluster = factor(pam_fit$clustering))
+ggplot(aes(x = X, y = Y), data = tsne_data) +
+  geom_point(aes(color = cluster))
+```
+
+
+Resumen de resultados los 5 clusters. 
+```{r summary PAM 3 clusters}
+#Clusters’ scorcard
+pam_results$the_summary
+
+rm(pam_results)
+rm(data_cluster_sample)
+
+```
+La parte positiva del modelo de PAM es que obtenemos unos resultados que aunque habría que ejecutar con una muestra más amplia o mejor definida, nos da unos patrones que nos permitirían explicar de manera clara a negocio los diferentes clusters.
+
+## CLARA
+Se utiliza CLARA (Clustering Large Applications) es un algoritmo de clasificacion basado en K-Means que utiliza tecnicaas de muestreo para caracterizar grandes datasets. Toma un numero pre-determinado de clusters. 
+
+```{r select variables de modelo}
+
+# Seleccion de variables para el modelo
+vars_modelo <- c('idunplug_station_ini','cp_ini','idplug_station_fin','cp_fin','travel_time','user_type', 'user_age_range','unplug_hour','day','distance')
+
+```
+
+
+### CON OUTLIERS
+En esta ejecucion del algoritmo se utilizan los datos con outliers (sin filtrado previo) y 6 clusters.
+
+```{r calculo clara con_outliers}
+# CON OUTLIERS
+
+# dataset
+data_modelo <- data %>% 
+  select(vars_modelo)
+
+# Convertir data types
+data_modelo[sapply(data_modelo, is.character)] <- lapply(data_modelo[sapply(data_modelo, is.character)], as.factor)
+
+
+# Compute CLARA
+# clara_result <- clara(data_modelo, 10, samples = 2500, pamLike = TRUE)
+load(file = 'clara_result.RData')
+
+# Add the point classifications to the original data, use this:
+data_modelo_clusters <- cbind(data_modelo, cluster = clara_result$cluster)
+head(data_modelo_clusters, n = 5)
+
+rm(data_modelo_clusters)
+
+```
+
+En el grafico se observa que el cluster-1 agrupa todos los aoutliers del dataset.
+```{r grafico clara con_outliers}
+
+# Cluster plot
+fviz_cluster(clara_result, stand = FALSE, geom = "point", pointsize = 1)
+
+```
+
+### SIN OUTLIERS
+En esta ejecucion del algortimo se toma el datatset original filtrado por quartiles extremos con la funcion `boxplot.stats()$out`. Se toman 5 clusters.
+
+```{r calculo clara sin_outliers}
+
+# SIN OUTLIERS
+
+# datatset
+data_modelo_nooutliers <- data_no_outliers %>% 
+  select(vars_modelo)
+
+# Convertir data types
+data_modelo_nooutliers[sapply(data_modelo_nooutliers, is.character)] <- lapply(data_modelo_nooutliers[sapply(data_modelo_nooutliers, is.character)], as.factor)
+
+# Compute CLARA
+# clara_result_nooutliers <- clara(data_modelo_nooutliers, 10, samples = 2500, pamLike = TRUE)
+load(file = 'clara_result_nooutliers.RData')
+
+# Add the point classifications to the original data, use this:
+data_modelo_nooutliers_clusters <- cbind(data_modelo_nooutliers, cluster = clara_result_nooutliers$cluster)
+head(data_modelo_nooutliers_clusters, n = 4)
+
+rm(data_modelo_nooutliers_clusters)
+
+```
+
+Se observa que los grupos est'an agrupados entre si, pero no hay mucha distancia entre clusters.
+```{r grafico clara sin_outliers}
+
+# Cluster plot
+fviz_cluster(clara_result_nooutliers, stand = FALSE, geom = "point", pointsize = 1)
+
+```
+
+# CONCLUSIONES
+
+-Los picos de uso de Bicimad se observan muy marcados con el inicio y fin de la jornada laboral, podría ser interesantes realizar acciones comerciales dirigidas hacia esas horas
+
+-Excluyendo los de edad desconocida, el 86% de usuarios son adultos (27-65 años)
+
+-Uso constante casi rutinario a nivel de semana, cayendo en los fines de semana, más pronunciado esto en los usuarios de edad adulta (27-65 años)
+
+-En lo referente a los clusters, aunque no se observan grandes diferencias entre los centroides, si aparecen bien definidos y explicados por las variables seleccionadas
+
+Comparando con los datos de Enero:
+- El uso del servicio baja en las horas de mayor calor 15-18 horas, se intensifica entre las 7-9 de la mañana.
+- En verano el uso entre las 19-22 horas se amplía
+- Los trayectos son más cortos, destacan muchos movimiento en el propio retiro o con estaciones centrales.
+
+*PROXIMOS PASOS*
+
+-Utilizar herramientas desktop para no tener problemáticas de memoria
+
+-Cruzar con datasets de eventos ligado a zonas
+
+-Volver a ejecutar el proyecto con datos de otros periodos, pues están algo sesgados por la temporalidad, para poder ver como se adaptan.
+
+
